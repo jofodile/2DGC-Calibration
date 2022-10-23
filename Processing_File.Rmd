@@ -1,0 +1,1536 @@
+---
+title: "GCxGC_cal"
+output: html_document
+author: "Emily Barnes Franklin"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Reading in Libraries
+```{r libs, echo=FALSE}
+library(Rcpp)
+#install.packages("caret")
+library(caret) # cross validation
+
+#install.packages("randomForest")
+library(randomForest)
+#install.packages("gbm")
+library(gbm)
+
+
+library(nnet)
+#install.packages("ROCR")
+library(ROCR)
+
+library(caTools)
+
+library(MASS)
+
+
+
+
+library(scales)
+
+library(akima)
+
+#install.packages("grid")
+library(grid)
+
+#install.packages("OrgMassSpecR")
+library(OrgMassSpecR)
+
+#install.packages("glue")
+library(glue)
+
+library(openxlsx)
+
+#install.packages("janitor")
+library(janitor)
+
+library(rpart) # CART
+#install.packages("rpart.plot")
+library(rpart.plot) # CART plotting
+
+#install.packages("CHNOSZ")
+library(CHNOSZ)
+
+#install.packages("Metrics")
+library(Metrics)
+library(data.table)
+
+library(dplyr)
+library(tidyverse)
+```
+
+Self-made functions for later use
+```{r}
+left_joinF <- function(x, y, fill = FALSE){
+  z <- left_join(x, y)
+  tmp <- setdiff(names(z), names(x))
+  z <- replace_na(z, setNames(as.list(rep(fill, length(tmp))), tmp))
+  z
+}
+
+left_join0<- function(x, y, fill = 0){
+  z <- left_join(x, y)
+  tmp <- setdiff(names(z), names(x))
+  z <- replace_na(z, setNames(as.list(rep(fill, length(tmp))), tmp))
+  z
+}
+
+rsq <- function (x, y) cor(x, y) ^ 2
+
+OSR2 <- function(predictions, train, test) {
+  SSE <- sum((test - predictions)^2)
+  SST <- sum((test - mean(train))^2)
+  r2 <- 1 - SSE/SST
+  return(r2)
+}
+
+trim.leading <- function (x)  sub("^\\s+", "", x)
+```
+
+## Parsing Out Mass Spectra
+
+In this section, a CSV file containing the names, locations, and mass spectra of all of the external standard components is read in.  The mass spectra are in the form of a semicolon separated string. The principle peaks and the mass differences between key peaks are the key indicators of functional groups that exert the greatest influence on the calibration factor of the compound in question.  In this section, the top 10 peaks (by intensity) are identified for each compound.  Then, the top 21 peaks (the 21 peaks which appear in the most compounds from the external standard list) are turned into factors, for which each compound indicates 'true' or 'false' depending on whether one of the top 10 peaks for that compound exists on the list.
+
+```{r ES_readin}
+# NOTE: still need to generate file for SSE external
+ES_table_o = read_csv(file = "Files/ES_MassSpec_SeaScape_EBF.csv") %>% 
+  filter(!is.na(data_file))
+
+
+
+ES_table_t = ES_table_o %>% 
+    dplyr::mutate(MS = strsplit(as.character(MS), ";")) %>% 
+    unnest(MS) %>% 
+    filter(MS != "") %>% 
+    dplyr::mutate(MS2 = trim.leading(MS)) 
+  
+
+
+
+ES_table_3 = separate(data = ES_table_t, col = MS2, into = c("mz", "intensity"), sep = " ")
+
+ES_table_full = ES_table_3 %>% 
+  dplyr::mutate(intensity = as.numeric(intensity)) %>% 
+  dplyr::mutate(mz = as.numeric(mz)) %>% 
+  arrange(desc(intensity)) %>% 
+  arrange(desc(Name)) %>% 
+  group_by(Name) %>%
+  dplyr::mutate(my_ranks = order(order(intensity, decreasing=TRUE))) %>% 
+  ungroup()
+
+ES_names <- ES_table_o %>% 
+  dplyr::select("Name")
+
+ES_table_trimmed = ES_table_full %>% 
+  filter(my_ranks < 11)
+
+mz_tab <- as.data.frame(table(ES_table_trimmed$mz))
+mz_tab <- mz_tab %>% 
+  dplyr::mutate(mz = as.character(Var1)) %>% 
+  dplyr::mutate(mz = as.numeric(mz))
+mz_tab <- mz_tab %>% 
+  arrange(desc(Freq)) %>% 
+  dplyr::mutate(freq_ranks = order(order(Freq, decreasing = TRUE)))
+
+ES_table_ranked <- ES_table_trimmed %>% 
+  left_join(mz_tab) %>% 
+  filter(freq_ranks< 41)
+
+ES_common_mz = ES_table_ranked %>%
+  dplyr::select(Name, mz, intensity) %>% 
+  dplyr::mutate(mz = paste("mz_", mz, sep = "_")) %>% 
+  dplyr::mutate(mz_obs = TRUE) %>% 
+  dplyr::mutate(mz_intensity = intensity)
+
+peak_list.es <- ES_common_mz %>% 
+  dplyr::select(mz) %>% 
+  dplyr::mutate(istop40 = TRUE) %>% 
+  distinct(mz, istop40, .keep_all = TRUE)
+
+wide_mz = ES_common_mz %>% 
+  dplyr::select(Name, mz, mz_obs) %>% 
+  spread(mz, mz_obs, fill = FALSE) 
+
+wide_mz <- ES_names %>% 
+  left_joinF(wide_mz)
+
+
+
+wide_mz_i = ES_common_mz %>% 
+  dplyr::select(Name, mz, mz_intensity) %>% 
+  spread(mz, mz_intensity, fill = 0) 
+  
+wide_mz_i <- ES_names %>% 
+  left_join0(wide_mz_i)
+  
+
+
+```
+
+Next, we parse the common losses in a similar manner.
+
+```{r}
+
+unique_names = unique(ES_table_trimmed$Name)
+
+x = seq(1, 5, 1)
+y = x
+
+d2 <- expand.grid(x = x, y = y, KEEP.OUT.ATTRS = FALSE)
+d2 <- d2 %>% 
+  filter(y > x)
+
+xt = d2$x
+
+yt = d2$y
+
+names_losses = as.character(rep(unique_names, each = length(d2$x)))
+losses_vec = rep(999, times = length(names_losses))
+loss_num = rep(seq(1, 10, 1), times = length(unique_names))
+
+losses <- data.frame(names_losses, losses_vec, loss_num)
+losses = losses %>% 
+  dplyr::mutate(names_losses = as.character(names_losses))
+
+
+
+for(i in 1:nrow(losses)) {
+  #i = 1
+  
+  name_t = names_losses[i]
+  loss_num_t = losses$loss_num[i]
+  
+  upper_index = xt[loss_num_t]
+  lower_index = yt[loss_num_t]
+  
+  df_t = ES_table_trimmed %>% 
+    filter(Name == name_t)
+  
+  upper_mz = df_t$mz[upper_index]
+  lower_mz = df_t$mz[lower_index]
+  
+
+  losses$losses_vec[i] = abs(upper_mz - lower_mz)
+  
+}
+
+arranged_mz <- ES_table_trimmed %>% 
+  arrange(desc(mz)) %>% 
+  arrange(desc(Name)) %>% 
+  dplyr::mutate(loss_fast = 0)
+
+for(i in 2:nrow(arranged_mz)){
+  arranged_mz$loss_fast[i]= arranged_mz$mz[i-1]-arranged_mz$mz[i]
+}
+
+arranged_mz.t <- as.data.frame(table(arranged_mz$loss_fast)) %>% 
+  dplyr::mutate(num_loss = as.character(Var1)) %>% 
+  dplyr::mutate(num_loss = as.numeric(num_loss)) %>% 
+  filter(num_loss > 0) %>% 
+  arrange(desc(Freq)) %>% 
+  dplyr::mutate(id = row_number())
+
+losses = losses %>%
+  left_join(arranged_mz.t, by = c("losses_vec"= "num_loss"))
+
+losses_trimmed = losses %>% 
+  filter(id<21) 
+
+
+
+ES_common_losses = losses_trimmed %>%
+  dplyr::select(names_losses, losses_vec) %>% 
+  dplyr::mutate(losses_vec = paste("loss_", losses_vec, sep = "_")) %>% 
+  dplyr::mutate(Loss_obs = TRUE) %>% 
+  distinct()
+
+loss_list.es <- ES_common_losses %>% 
+  dplyr::select(losses_vec) %>% 
+  dplyr::mutate(istop20 = TRUE) %>% 
+  distinct(losses_vec, istop20, .keep_all = TRUE)
+
+wide_losses = ES_common_losses %>% 
+  spread(losses_vec, Loss_obs, fill = FALSE) %>% 
+  right_join(ES_names, by = c("names_losses"= "Name"))
+
+wide_losses[is.na(wide_losses)] <- FALSE
+```
+
+
+## Importing all of the Blob Table Index
+
+Each point of each of the 5 calibration curves is saved as a blob table file containing the abundance of each of the external standard compounds in that sample run (aka cal curve point).  In order to read in these files with the necessary general information on what day the cal curve occurred and what point of the cal curve each run corresponds to, an index is read in with the file names and additional information.  
+
+```{r timeline_testing, warning = FALSE, message= FALSE}
+#reading in the index of the blob tables
+bt_sum <- read_csv("Files/Blob_Table_Summary_ES_SeaScape_EBF.csv")
+
+#adding a date column that R will recognize
+
+bt_sum <- bt_sum %>% dplyr::mutate(r_rundate = as.Date(Run_date, format = "%m/%d/%y"))
+
+
+
+# making a function that will make the correct file names from the table of samples so that my actual sample files can be read in
+# note that you might need to adjust this to match file headers/names
+make_file_name_es <- function(date_string) {
+  file_start <- "Files/Cal_Curve_Files/sse_full_"
+  file_end <- ".csv"
+  full_name <- paste(file_start,date_string,file_end, sep = "")
+  return(full_name)
+  
+}
+
+# function to read in files 
+read_bt_files <- function(fi_name_short) {
+  
+  fi_name <- make_file_name_es(fi_name_short)
+  temp_bt <<- read_csv(file = fi_name)
+  temp_bt <- temp_bt %>% dplyr::mutate(File_num = fi_name_short)
+  temp_bt <<- temp_bt
+  return(temp_bt)
+}
+
+#reading in all of the blob tables and turning them into one big blob table- creating a long table
+make_massive_table <- function(summary_table){
+ 
+  M <- read_bt_files(as.character(summary_table$File_num[1]))
+
+  for(i in 2:length(summary_table$File_num)){
+    t <- read_bt_files(as.character(summary_table$File_num[i]))
+    Mnew <- rbind(M, t)
+    M <- Mnew
+    print(i)
+  }
+  M_t <<- M
+}
+
+make_massive_table(bt_sum)
+
+#adding in all information from the summary table
+M_t_full <- M_t %>% left_join(bt_sum)
+
+# tidying column names
+names(M_t_full) <- make.names(names(M_t_full),unique = TRUE)
+
+```
+
+
+```{r match_finding, message =FALSE}
+# filtering out bad LRI matches
+Match_factor_floor <- 750
+Reverse_match_factor_floor <- 800
+LRI_diff_floor <- 10
+
+
+fb_match_factor_floor <- 600
+fb_reverse_match_factor_floor <- 700
+IS_lib_name <- "caice_ssi"
+FB_lib_name <- "caice_ssa_fb_0803_1919"
+ES_lib_name <- "caice_sse"
+
+IS_rem1 <- "glucose-13C6"
+IS_rem2 <- "dC14"
+IS_rem3 <- "d-C6diacid"
+
+
+# fixing naming problems for dC14 nd removing glucose (because it is a bad IS)
+M_t_full <- M_t_full %>% 
+  mutate(Library.Name = ifelse(Library.Name == "-", IS_lib_name, Library.Name)) %>% 
+  filter(Compound.Name != IS_rem1) %>% 
+  filter(Compound.Name != IS_rem2) %>% 
+  filter(Compound.Name != IS_rem3)
+
+
+
+rt2_floor <- .2 # note: check on this, but for purposes of indexing retention times in 2d this is important
+# note this has been changed, was .5 before
+
+# creating a column of the differences in linear retention indecies so that poor matches can be screened out
+M_t_LRI <- M_t_full %>% dplyr::mutate(LRI_diff = abs(Library.RI-LRI.I)) 
+
+# identifying the internal standard
+IS_goodmatch <- M_t_LRI %>% 
+  filter(Library.Name == IS_lib_name) %>% 
+  filter(LRI_diff < LRI_diff_floor-5) %>% 
+  filter(Library.Match.Factor > Match_factor_floor-100)# down adjusting LRI match factor due to some misses of good matches 
+
+perylene_check <- M_t_LRI %>% 
+  filter(Compound.Name == "perylene-d")
+
+IS_check <- M_t_LRI %>% 
+  filter(Library.Name == IS_lib_name) %>% 
+  group_by(Compound.Name, File_num) %>% 
+  summarise(Volume_tot = sum(Volume))
+
+table(IS_check$Compound.Name)
+
+# note that we need to go in and fix the cal points for the times when nothing is getting detected
+  
+
+FB_goodmatch <- M_t_LRI %>% 
+  filter(Library.Name == FB_lib_name) %>% 
+  filter(LRI_diff < LRI_diff_floor) %>% 
+  filter(Library.Match.Factor > fb_match_factor_floor || Library.Reverse.Match.Factor > fb_reverse_match_factor_floor)
+
+M_t_all_analytes <- M_t_LRI %>% 
+  anti_join(IS_goodmatch) %>% 
+  anti_join(FB_goodmatch)
+
+  
+M_t_analyte_unique <- M_t_all_analytes %>% 
+  filter(Library.Name != IS_lib_name) %>% 
+  filter(Library.Name != FB_lib_name) %>% 
+  filter(LRI_diff < LRI_diff_floor) %>% 
+  filter(Library.Match.Factor > Match_factor_floor || Library.Reverse.Match.Factor > Reverse_match_factor_floor) %>% 
+  arrange(desc(Volume)) %>% 
+  arrange(Compound.Name) %>% 
+  arrange(File_num) %>% 
+  distinct(Compound.Name, File_num, .keep_all = TRUE)
+
+```
+The metrics used for screening out bad matches are up for some level of interpretation and as a result it is important to keep track of performance metrics.
+```{r evaluating_lib_performance}
+
+# tracking the mass of all of the analytes before bad matches are screened out for later analysis of library performance
+M_t_all_analytes_volcount <- M_t_all_analytes %>% 
+  group_by(File_num) %>% 
+  summarise(rawvol = sum(Volume))
+
+# tracking the number of all analutes in
+M_t_all_analytes_ncount <- M_t_all_analytes %>% 
+  count(File_num) %>% 
+  dplyr::rename(total_num_analyte = n)
+
+M_t_match_analytes_volcount <- M_t_analyte_unique %>% 
+  group_by(File_num) %>% 
+  summarise(rawvol_match = sum(Volume))
+
+M_t_match_analytes_ncount <- M_t_analyte_unique %>% 
+  count(File_num) %>% 
+  dplyr::rename(total_num_analyte_match = n)
+
+M_t_analyte_summary <- M_t_all_analytes_volcount %>% 
+  left_join(M_t_all_analytes_ncount) %>% 
+  left_join(M_t_match_analytes_volcount) %>% 
+  left_join(M_t_match_analytes_ncount) %>% 
+  dplyr::mutate(perct_nfound = (total_num_analyte_match/total_num_analyte)*100) %>% 
+  dplyr::mutate(perct_volfound = (rawvol_match/rawvol)*100)
+
+compound_pop <- M_t_analyte_unique %>% 
+  count(Compound.Name) %>% 
+  dplyr::rename(comp.n = n) %>% 
+  dplyr::mutate(pct_of_samp = (comp.n/max(comp.n)*100))
+
+
+M_t_analyte_count <- M_t_all_analytes %>% 
+  count(File_num) %>%
+  dplyr::rename(total_num_analyte = n)
+# 
+# # counting the number of unique analytes in each image
+num_analyte_unique <- M_t_analyte_unique %>%
+  count(File_num) %>%
+  dplyr::rename(unique.analyte = n)
+
+# counting the number based percent of compounds being traced in all 
+perct_comps_traced <- num_analyte_unique %>% 
+   left_join(M_t_analyte_count) %>% 
+   dplyr::mutate(pct_found = unique.analyte/total_num_analyte)
+# 
+#perct_comps_traced %>%
+#  ggplot(aes(y = pct_found))+
+#  geom_boxplot()
+
+summary(perct_comps_traced$pct_found)
+
+
+M_t_analyte_unique <- M_t_analyte_unique %>% left_join(num_analyte_unique)
+
+compound_pop <- M_t_analyte_unique %>% 
+  count(Compound.Name) %>% 
+  dplyr::rename(comp.n = n) %>% 
+  dplyr::mutate(pct_of_samp = (comp.n/max(comp.n)*100))
+
+table(compound_pop$comp.n)
+
+hist(compound_pop$pct_of_samp, 
+     main = paste("Histogram of", nrow(compound_pop), "Traced Compounds\nOver External Standards"),
+     xlab = "Percent Occurence Above Detection Limits",
+     col = "grey")
+
+M_t_analyte_unique <- M_t_analyte_unique %>% 
+  left_join(compound_pop)
+
+
+M_t_analyte_unique %>% 
+  dplyr::mutate(char_comp_n = as.integer(round(pct_of_samp, 0))) %>% 
+  group_by(char_comp_n) %>% 
+  summarise(avg_vol_byn = mean(Volume)) %>% 
+  ggplot(aes(x = char_comp_n, y = avg_vol_byn)) +
+  geom_col()+
+  labs(title = "Average Blob Volume by Library Match Frequency")+
+  xlab("Percent of Samples with Positive Library Match")+
+  ylab("Average Blob Volume")
+
+
+
+```
+## Internal Standard Mapping
+
+Internal standard assignments in raw blob tables require cleaning before they can be utilized for normalization, similar to the external standard components.
+```{r IS_mapping}
+# note: unlike sample analytes, internal standard compounds are frequently split vertically into multiple blobs because of the high volume.  In order to account for this, I am summing all blobs together that meet the high match criteria and are very close in the first dimension.
+IS_unique <- IS_goodmatch %>% 
+  group_by(Compound.Name, File_num) %>% 
+  summarise(Volume_tot = sum(Volume))
+
+table(IS_unique$Compound.Name)
+
+perylene_check <- IS_goodmatch %>% 
+  filter(Compound.Name == "perylene-d")
+
+fixing <- data.frame(table(IS_unique$Compound.Name)) %>% 
+  dplyr::mutate(Compound.Name = Var1)
+
+# note this indicates that all of the IS compounds are there- good
+
+IS_positions <- IS_goodmatch %>% 
+  dplyr::group_by(Compound.Name, File_num) %>% 
+  #summarise(LRI_avg = mean(LRI.I), RI2 = min(Retention.II..sec.-rt2_floor))
+  dplyr::summarise(LRI_avg = mean(LRI.I), RI2 = min(abs(Retention.II..sec. - rt2_floor)))
+
+table(IS_positions$Compound.Name)
+
+IS_avg_vols_toadd <- IS_unique %>% 
+  dplyr::group_by(Compound.Name) %>% 
+  dplyr::summarise(IS_avgvol = mean(Volume_tot), IS_medvol = median(Volume_tot)) %>% 
+  dplyr::left_join(IS_unique) %>% 
+  dplyr::mutate(IS_mean_norm = Volume_tot / IS_avgvol) %>%
+  dplyr::mutate(IS_med_norm = Volume_tot / IS_medvol) %>% 
+  dplyr::select(Compound.Name, File_num, IS_mean_norm)
+
+IS_unique_pos <- IS_unique %>% 
+  left_join(IS_positions) %>% 
+  left_join(IS_avg_vols_toadd)
+
+
+
+IS_test1 <- IS_unique_pos %>% 
+  filter(File_num == "20200731_0304_5")
+
+IS_1_vol <- IS_test1$Volume_tot
+RI1 <- IS_test1$LRI_avg
+RI2 <- IS_test1$RI2
+
+write.csv(IS_positions, "Files/Write/IS_positions_ESmod_SS.csv")
+
+# IS_1_pos <- IS_test1 %>% 
+#   ungroup() %>% 
+#   dplyr::select("LRI_avg", "RI2")
+
+IS_positions_avg <- IS_positions %>% 
+  dplyr::group_by(Compound.Name) %>% 
+  dplyr::summarise(LRI_avg_all = mean(LRI_avg, na.rm = TRUE), RI2_all = mean(RI2, na.rm = TRUE)) 
+
+
+write.csv(IS_positions_avg, "Files/Write/IS_positions_avg_ESmod_SS.csv")
+
+IS_mean_med_sample <- read_csv("Files/IS_mean_med_vols_SSAbloom3_samples.csv")
+
+# note- reading in average volumes from the sample run, because the normalization of samples and standards must stay consistent
+
+IS_avg_vols <- IS_unique %>% 
+  dplyr::group_by(Compound.Name) %>% 
+  dplyr::summarise(IS_avgvol.es = mean(Volume_tot), IS_medvoles = median(Volume_tot)) %>% 
+  left_join(IS_mean_med_sample) %>% 
+  left_join(IS_unique) %>% 
+  dplyr::mutate(IS_mean_norm = Volume_tot / IS_avgvol) %>%
+  dplyr::mutate(IS_med_norm = Volume_tot / IS_medvol) %>% 
+  left_join(bt_sum)
+```
+
+# Normalizing cal points by the average of the nearest 3 internal standard compounds (self normalized)
+
+```{r IS_mapping2}
+LRI_weight = 10 # note changed from 2 
+LRII_weight = 1
+
+LRI1_avg = mean(IS_positions_avg$LRI_avg_all, na.rm = TRUE)
+LRI2_avg = mean(IS_positions_avg$RI2_all)
+
+IS_positions_avg <- IS_positions_avg %>% 
+  dplyr::mutate(relative_LRI = (LRI_avg_all/LRI1_avg)*LRI_weight) %>% 
+  dplyr::mutate(relative_LRI2 = (RI2_all/LRI2_avg)*LRII_weight)
+
+write.csv(IS_positions_avg, "Files/Write/IS_positions_avg_rel_ESmod.csv")
+
+
+
+Analyte_positions_trial <- M_t_analyte_unique %>% 
+  dplyr::group_by(Compound.Name, File_num) %>% 
+  dplyr::summarise(LRI_avg = mean(LRI.I), RI2 = median(Retention.II..sec. - rt2_floor))
+
+# note filtering out three small blobs outside of RI window
+
+Analyte_positions <- M_t_analyte_unique %>% 
+  filter(!is.na(LRI.I)) %>% 
+  dplyr::group_by(Compound.Name) %>% 
+  dplyr::summarise(LRI_avg = mean(LRI.I, na.rm = TRUE), RI2 = median(Retention.II..sec. - rt2_floor))
+
+Analyte_positions <- Analyte_positions %>% 
+  dplyr::mutate(relative_LRI = (LRI_avg/LRI1_avg)*LRI_weight) %>% 
+  dplyr::mutate(relative_LRI2 = (RI2/LRI2_avg)*LRII_weight)
+
+# checking to make sure that the ranges match up, eg back end checking that same norm method used on moth IS and analyte positions
+summary(IS_positions_avg$relative_LRI)
+summary(Analyte_positions$relative_LRI)
+summary(IS_positions_avg$relative_LRI2)
+summary(Analyte_positions$relative_LRI2)
+
+Analyte_pos_short <- Analyte_positions %>% 
+  dplyr::select(relative_LRI, relative_LRI2)
+
+IS_pos_short <- IS_positions_avg %>% 
+  dplyr::select(relative_LRI, relative_LRI2)
+
+#knn(IS_pos_short, Analyte_pos_short, cl=IS_pos_short$Compound.Name, k=1, l=0)
+
+#Old method, only using 1 nearest
+#testnn <- nn2(IS_pos_short, query = Analyte_pos_short, treetype = "kd", searchtype = "standard", k=1)
+library(RANN)
+# note 1.19 is the min radius at which every compound has at least one nearest
+testnn <- nn2(IS_pos_short, query = Analyte_pos_short, treetype = "kd", searchtype = "radius", k=3, radius = 3.9)
+
+
+Analyte_IS_Index <- data.frame(testnn$nn.idx)
+# old method only using 1 nearest
+# Analyte_pos_ad <- data.frame(Compound.Name = Analyte_positions$Compound.Name, IS_index = Analyte_IS_Index)
+
+Analyte_pos_ad <- data.frame(Compound.Name = Analyte_positions$Compound.Name, IS_index1 = Analyte_IS_Index$X1, IS_index2 = Analyte_IS_Index$X2, IS_index3 = Analyte_IS_Index$X3)
+
+# old method with only 1 IS
+# Analyte_with_IS <- Analyte_pos_ad %>% 
+#   dplyr::mutate(IS_appropriate = IS_positions_avg$Compound.Name[IS_index])
+
+# Analyte_with_IS <- Analyte_pos_ad %>% 
+#   dplyr::mutate(IS_appropriate1 = IS_positions_avg$Compound.Name[IS_index1]) %>% 
+#   dplyr::mutate(IS_appropriate2 = IS_positions_avg$Compound.Name[IS_index2]) %>% 
+#   dplyr::mutate(IS_appropriate3 = IS_positions_avg$Compound.Name[IS_index3])
+
+Analyte_with_IS <- Analyte_pos_ad %>% 
+  dplyr::mutate(IS_appropriate1 = NA) %>% 
+  dplyr::mutate(IS_appropriate2 = NA) %>% 
+  dplyr::mutate(IS_appropriate3 = NA)
+
+for(i in 1:nrow(Analyte_with_IS)){
+  t_isind_1 <- Analyte_with_IS$IS_index1[i]
+  t_isind_2 <- Analyte_with_IS$IS_index2[i]
+  t_isind_3 <- Analyte_with_IS$IS_index3[i]
+  
+  if(t_isind_1 > 0){
+  t_isap_1 <- IS_positions_avg$Compound.Name[t_isind_1]
+  }else{
+    t_isap_1 <- NA
+  }
+  
+  if(t_isind_2 > 0){
+  t_isap_2 <- IS_positions_avg$Compound.Name[t_isind_2]
+  }else{
+    t_isap_2 <- NA
+  }
+  
+  if(t_isind_3 > 0){
+  t_isap_3 <- IS_positions_avg$Compound.Name[t_isind_3]
+  }else{
+    t_isap_3 <- NA
+  }
+  
+  
+  
+  Analyte_with_IS$IS_appropriate1[i] <- t_isap_1
+  Analyte_with_IS$IS_appropriate2[i] <- t_isap_2
+  Analyte_with_IS$IS_appropriate3[i] <- t_isap_3
+  
+}
+
+# Analyte_with_IS_positions <- Analyte_with_IS %>% 
+#   left_join(Analyte_positions) %>% 
+#   left_join(IS_positions_avg, by = c("IS_appropriate"= "Compound.Name"))
+
+Analyte_with_IS_positions <- Analyte_with_IS %>% 
+  left_join(Analyte_positions) %>% 
+  left_join(IS_positions_avg, by = c("IS_appropriate1"= "Compound.Name")) %>% 
+  left_join(IS_positions_avg, by = c("IS_appropriate2"= "Compound.Name")) %>% 
+  left_join(IS_positions_avg, by = c("IS_appropriate3"= "Compound.Name"))
+
+M_t_analyte_withIS <- M_t_analyte_unique %>% 
+  left_join(Analyte_with_IS) %>% 
+  dplyr::mutate(IS_vol1= -999*(LRI.I/LRI.I)) %>% 
+  dplyr::mutate(IS_mean_norm1= -999*(LRI.I/LRI.I)) %>% 
+  dplyr::mutate(IS_vol2= -999*(LRI.I/LRI.I)) %>% 
+  dplyr::mutate(IS_mean_norm2= -999*(LRI.I/LRI.I)) %>% 
+  dplyr::mutate(IS_vol3= -999*(LRI.I/LRI.I)) %>% 
+  dplyr::mutate(IS_mean_norm3= -999*(LRI.I/LRI.I)) %>% 
+  dplyr::mutate(IS_vol_dalk= -999*(LRI.I/LRI.I)) %>% 
+  dplyr::mutate(IS_mean_norm_dalk= -999*(LRI.I/LRI.I))
+
+# old- only 1 IS
+# M_t_analyte_withIS <- M_t_analyte_unique %>% 
+#   left_join(Analyte_with_IS) %>% 
+#   dplyr::mutate(IS_vol= -999*(LRI.I/LRI.I)) %>% 
+#   dplyr::mutate(IS_mean_norm= -999*(LRI.I/LRI.I)) 
+
+
+# for(i in 1:nrow(M_t_analyte_withIS)){
+#   
+#   
+#   IS_name = M_t_analyte_withIS$IS_appropriate[i]
+#   File_num_t = M_t_analyte_withIS$File_num[i]
+#   
+#   IS_indicated <- IS_stability %>% 
+#     filter(Compound.Name == IS_name) %>% 
+#     filter(File_num == File_num_t)
+#   
+#   M_t_analyte_withIS$IS_vol[i] <-IS_indicated$Volume_tot[1]
+#   M_t_analyte_withIS$IS_mean_norm[i] <-IS_indicated$IS_mean_norm[1]
+#   
+#   
+# }
+
+for(i in 1:nrow(M_t_analyte_withIS)){
+  
+  
+  
+  IS_name1 = M_t_analyte_withIS$IS_appropriate1[i]
+  IS_name2 = M_t_analyte_withIS$IS_appropriate2[i]
+  IS_name3 = M_t_analyte_withIS$IS_appropriate3[i]
+  
+  
+  
+  
+  File_num_t = M_t_analyte_withIS$File_num[i]
+  
+  
+  
+  IS_indicated1 <- IS_avg_vols %>% 
+    filter(Compound.Name == IS_name1) %>% 
+    filter(File_num == File_num_t)
+  
+  M_t_analyte_withIS$IS_vol1[i] <-IS_indicated1$Volume_tot[1]
+  M_t_analyte_withIS$IS_mean_norm1[i] <-IS_indicated1$IS_mean_norm[1]
+  
+  IS_indicated2 <- IS_avg_vols %>% 
+    filter(Compound.Name == IS_name2) %>% 
+    filter(File_num == File_num_t)
+  
+  M_t_analyte_withIS$IS_vol2[i] <-IS_indicated2$Volume_tot[1]
+  M_t_analyte_withIS$IS_mean_norm2[i] <-IS_indicated2$IS_mean_norm[1]
+  
+  IS_indicated3 <- IS_avg_vols %>% 
+    filter(Compound.Name == IS_name3) %>% 
+    filter(File_num == File_num_t)
+  
+  M_t_analyte_withIS$IS_vol3[i] <-IS_indicated3$Volume_tot[1]
+  M_t_analyte_withIS$IS_mean_norm3[i] <-IS_indicated3$IS_mean_norm[1]
+  
+}
+
+# 
+# M_t_analyte_withIS <- M_t_analyte_withIS %>% 
+#   dplyr::mutate(vol_is_normnorm = Volume/IS_mean_norm) %>% 
+#   dplyr::mutate(vol_is_rawnorm = Volume/IS_vol)
+#   
+
+# note- this step is not working
+# M_t_analyte_withIS <- M_t_analyte_withIS %>% 
+#   dplyr::mutate(IS_vol = mean(c(IS_vol1, IS_vol2, IS_vol3), na.rm = TRUE)) %>% 
+#   dplyr::mutate(IS_mean_norm = mean(c(IS_mean_norm1, IS_mean_norm2, IS_mean_norm3), na.rm = TRUE))
+
+for(i in 1:nrow(M_t_analyte_withIS)){
+  
+  isvols_raw <- c(M_t_analyte_withIS$IS_vol1[i], M_t_analyte_withIS$IS_vol2[i], M_t_analyte_withIS$IS_vol3[i])
+  
+  M_t_analyte_withIS$IS_vol[i] = mean(isvols_raw, na.rm = TRUE)
+  
+  isvols_norm <- c(M_t_analyte_withIS$IS_mean_norm1[i], M_t_analyte_withIS$IS_mean_norm2[i], M_t_analyte_withIS$IS_mean_norm3[i])
+  
+  M_t_analyte_withIS$IS_mean_norm[i] = mean(isvols_norm, na.rm = TRUE)
+  
+}
+
+
+M_t_analyte_withIS <- M_t_analyte_withIS %>% 
+  dplyr::mutate(vol_is_normnorm = Volume/IS_mean_norm) %>% 
+  dplyr::mutate(vol_is_rawnorm = Volume/IS_vol) #%>%
+  #dplyr::mutate(vol_is_normnorm_ptnorm = vol_is_normnorm/(Punch_num_s) %>% 
+  #dplyr::mutate(vol_is_rawnorm_ptnorm = vol_is_rawnorm/(Punch_num_sample_time_norm))
+
+
+IS_problems <- M_t_analyte_withIS %>% 
+  filter(is.na(vol_is_normnorm))
+
+IS_problems_long <- M_t_analyte_withIS %>% 
+  filter(is.na(IS_vol1)|is.na(IS_vol2)|is.na(IS_vol3))
+
+IS_assignments <- M_t_analyte_withIS %>% 
+  dplyr::select(Compound.Name, IS_appropriate1,IS_mean_norm1, IS_appropriate2, IS_mean_norm2,
+                IS_appropriate3,  IS_mean_norm3) %>% 
+  group_by(Compound.Name, IS_appropriate1, IS_appropriate2, IS_appropriate3) %>% 
+  summarize(IS_mean_norm1.n = mean(IS_mean_norm1), IS_mean_norm2.n = mean(IS_mean_norm2), 
+            IS_mean_norm3.n = mean(IS_mean_norm3))
+  
+```
+```{r}
+M_t_analyte_unique_IS <- M_t_analyte_withIS
+```
+
+## Loading External Standard
+
+Next the External standard calibration point information must be added into the processed blob files and reformatted for future modeling. Additionally, cal curves must be plotted to identify problematic points. 
+
+```{r, message = FALSE, warning = FALSE}
+cal_pts <- read_csv("Files/Cal_Curve_points_ES_SS.csv")
+
+# tidying column names
+names(cal_pts) <- make.names(names(cal_pts),unique = TRUE)
+
+
+
+cal_pts_long <- cal_pts %>% 
+  filter(Cal_pt_2 >0) %>%     # rem cpnds that do not have cal curves in the input file
+  gather(key = "Cal_Point", value = "Cal_amt_ng",
+       Cal_pt_1, Cal_pt_2, Cal_pt_3, Cal_pt_4, Cal_pt_5, Cal_pt_6) %>% 
+  dplyr::select(Compound.Name, Cal_Point, Cal_amt_ng)
+
+n_c_full <- M_t_analyte_unique_IS %>% 
+  left_join(cal_pts_long)
+
+
+for(i in 1:nrow(cal_pts)){
+
+  bid_temp <- cal_pts$Compound.Name[i]
+
+  n_c_full_sub <- n_c_full %>% 
+    filter(Compound.Name == bid_temp) %>% 
+    dplyr::select(Compound.Name, r_rundate, Cal_amt_ng, vol_is_normnorm, Cal_Point)
+
+  p <- n_c_full_sub %>% 
+    ggplot(aes(x = Cal_amt_ng, y = vol_is_normnorm, color = as.factor(r_rundate), size = Compound.Name))+
+    geom_point()
+  
+  print(p)
+}
+
+
+homosalate <- n_c_full %>% 
+  filter(Compound.Name == "homosalate, TMS")
+
+homosalate%>% 
+    ggplot(aes(x = Cal_amt_ng, y = vol_is_normnorm, color = as.factor(r_rundate), size = Compound.Name))+
+    geom_point()
+
+```
+Problematic cal curve points must be manually removed- as no single cal point is consistently off, it is probable that rather than a preparation error, there has been an issue with compound identification either in GC image or in the screening tools used prior to remove duplicate identification.  As the goal is to quantify unknown compounds and I know that the points should if prepared correctly corm a straight line, points which violate this are manually removed. 
+
+```{r}
+ES_badpts <- read_csv("Files/Cal_pts_to_remove_ss_EBF.csv") %>% 
+  dplyr::mutate(r_rundate = as.Date(Run_date, format = "%m/%d/%y")) %>% 
+  filter(!is.na(Compound.Name)) %>% 
+  dplyr::select(-Run_date) %>% 
+  dplyr::mutate(rem = TRUE)
+
+cal_pts_problem_cpnds <- cal_pts %>% 
+  filter(Check == TRUE) %>%
+  dplyr::select(Compound.Name, Check)
+
+ES_cleaned1 <- n_c_full %>% 
+  left_join(cal_pts_problem_cpnds) %>% 
+  filter(is.na(Check)) %>% 
+  left_join(ES_badpts) %>% 
+  filter(is.na(rem)) %>% 
+  dplyr::select(-c(rem, Check))
+
+
+
+for(i in 1:nrow(cal_pts)){
+
+  bid_temp <- cal_pts$Compound.Name[i]
+
+  n_c_full_sub <- ES_cleaned1 %>% 
+    filter(Compound.Name == bid_temp)
+
+  p <- n_c_full_sub %>% 
+    ggplot(aes(x = Cal_amt_ng, y = vol_is_normnorm, color = as.factor(r_rundate), size = Compound.Name))+
+    geom_point()
+  
+  print(p)
+}
+
+```
+Next we convert each set of calibration points into a calibration factor by extracting the IS normalized (self-normalized) slope.
+
+```{r}
+cal_pts_keep <- cal_pts %>% 
+  filter(Check == FALSE)
+
+cpnds <- cal_pts_keep$Compound.Name
+dates <- bt_sum$r_rundate
+
+cal_curves <- expand.grid(cpnds, dates, KEEP.OUT.ATTRS = TRUE, stringsAsFactors = FALSE)
+
+cal_curves <- distinct(cal_curves)
+
+names(cal_curves) <- c("cpnd", "dates")
+
+cal_curves$slope <- rep(-999, nrow(cal_curves))
+cal_curves$r2 <- rep(-999, nrow(cal_curves))
+
+for(i in 1:nrow(cal_curves)){
+  #print(i)
+  
+  #i = 140
+  compound = cal_curves$cpnd[i]
+  day = cal_curves$dates[i]
+  
+  subset <- ES_cleaned1 %>% 
+    filter(Compound.Name == compound) %>% 
+    filter(r_rundate == day) %>% 
+    filter(!is.na(vol_is_normnorm))
+  
+  if(nrow(subset)<2){
+    next
+  }
+  
+  
+  
+  lm_temp <- lm(Cal_amt_ng ~ 0 + vol_is_normnorm, data = subset)
+  
+  #summary(lm_temp)
+  
+  
+  
+  slope <- as.numeric(coefficients(lm_temp))
+  
+  cal_curves$slope[i] <- slope
+  
+  
+  r2 <- summary(lm_temp)$r.squared
+  
+  cal_curves$r2[i] <- r2
+  
+  
+}
+
+real_cc <- cal_curves %>% 
+  filter(r2 > .6)
+
+hist(real_cc$r2) # Cal clurve slopes are looking awesome!
+
+names_RI <- ES_table_o %>% 
+  dplyr::select(Name, d_alkane_RTI)
+
+real_cc_withRI <- real_cc %>% 
+  left_join(names_RI, by= c("cpnd"= "Name"))
+
+write.csv(real_cc_withRI, file = "cal_factors_ES_SS.csv")
+
+real_cc_withRI %>% ggplot(aes(x = cpnd, y = slope))+
+  geom_boxplot()
+
+real_cc_avg <- real_cc %>% 
+  group_by(cpnd) %>% 
+  dplyr::summarise(slope.avg = mean(slope, na.rm = TRUE)) %>% 
+  left_join(names_RI, by= c("cpnd"= "Name")) %>% 
+  mutate(inverse_slope = 1/slope.avg) %>% 
+  dplyr::rename(Compound.Name = cpnd)
+
+real_cc_avg %>% 
+  ggplot(aes(x = d_alkane_RTI, y = 1/slope.avg))+
+  geom_point()
+
+
+```
+
+```{r}
+
+cat <- read_csv("Files/Compound_cat_ES_SS.csv") %>% 
+  left_join(ES_table_o, by =c("Compound.Name"= "Name") )
+
+seed <- 1:20000
+dalk_pctdif <- 1:20000
+rt2_pctdif <- 1:20000
+
+Seed <- data.frame(seed, dalk_pctdif, rt2_pctdif)
+
+
+
+for(i in 1:nrow(Seed)){
+  #i = 1000
+  set.seed(Seed$seed[i])
+  split.t = sample.split(cat$Category, SplitRatio = 0.8)
+
+
+  Cat.train.t <- filter(cat, split.t == TRUE) 
+  
+    
+  
+  
+  Cat.test.t <- filter(cat, split.t == FALSE)%>%
+    arrange(Compound.Name)
+  
+  
+  Seed$dalk_pctdif[i]= abs(mean(Cat.train.t$d_alkane_RTI, na.rm = TRUE)-
+                             mean(Cat.test.t$d_alkane_RTI, na.rm = TRUE))/
+                      mean(Cat.train.t$d_alkane_RTI, na.rm = TRUE)
+  
+  Seed$rt2_pctdif[i]= abs(mean(Cat.train.t$RT2, na.rm = TRUE)-
+                             mean(Cat.test.t$RT2, na.rm = TRUE))/
+                      mean(Cat.train.t$RT2, na.rm = TRUE)
+  
+  
+}
+
+Seed <- Seed %>% 
+  dplyr::mutate(mult.diff = dalk_pctdif*rt2_pctdif) %>% 
+  dplyr::mutate(sum.diff = dalk_pctdif+rt2_pctdif) 
+
+set.seed(18135)
+split.f = sample.split(cat$Category, SplitRatio = 0.8)
+
+
+Cat.train <- filter(cat, split.f == TRUE) 
+  
+    
+Cat.test <- filter(cat, split.f == FALSE)
+
+```
+Now plotting the slopes of compounds visualized by their compound categories
+```{r}
+cat.j <- cat %>% 
+  dplyr::select(Compound.Name, Category)
+
+real_cc_avg.c <- real_cc_avg %>% 
+  left_join(cat.j)
+
+write.csv(real_cc_avg.c, "Files/Write/CC_slopes_categories_for_curve2.csv")
+
+real_cc_avg %>% 
+  left_join(cat) %>% 
+  ggplot(aes(x = d_alkane_RTI, y = inverse_slope, color = Category))+
+  geom_point()
+
+
+```
+Correcting by the average volatility curve
+
+```{r}
+Cat.ms.all.q <- cat %>% 
+  dplyr::select(Compound.Name, Formula, Category, d_alkane_RTI, RT2) %>% 
+  left_join(wide_mz_i, by = c("Compound.Name" = "Name")) %>% 
+  left_join(wide_losses, by = c("Compound.Name" = "names_losses")) %>% 
+  left_join(real_cc_avg) %>% 
+  dplyr::mutate(RTI.transform = NA) %>% 
+  filter(!is.na(d_alkane_RTI)) # note that this removes C7 acid from analysis
+  
+ # this is where we are normalizing by the avg volatility curve
+for(i in 1:nrow(Cat.ms.all.q)){
+  lri = Cat.ms.all.q$d_alkane_RTI[i]
+  if(lri<1870){
+    Cat.ms.all.q$RTI.transform[i] = (0.0000074*exp(0.0105*lri))
+  }else{
+    Cat.ms.all.q$RTI.transform[i] = (37900*exp(lri*-.00147))
+  }
+}
+
+
+Cat.ms.all.q <- Cat.ms.all.q %>% 
+  dplyr::mutate(slope.i.q = (1/slope.avg)/RTI.transform)
+
+Cat.ms.all.q %>% 
+  ggplot(aes(x = d_alkane_RTI, y = slope.i.q, color = Category))+
+  geom_point()
+
+Cat.ms.all.q %>% 
+  ggplot(aes(x = d_alkane_RTI, y = log(slope.i.q), color = Category))+
+  geom_point()
+
+Cat.ms.all.q.rti <- Cat.ms.all.q %>% 
+  dplyr::select(d_alkane_RTI, RTI.transform, Category) %>% 
+  arrange(desc(d_alkane_RTI)) %>% 
+  distinct()
+
+normc <- Cat.ms.all.q.rti %>% 
+  ggplot(aes(x = d_alkane_RTI, y = RTI.transform, color = "Response \nNormalization Curve"))+
+  geom_line(size = 2)+
+  geom_point(data = Cat.ms.all.q, aes(x = d_alkane_RTI, y = 1/slope.avg, fill = Category), shape = 21)+
+  geom_line(aes(x = d_alkane_RTI, y = RTI.transform), color = "black", size = 2)+
+  xlab("Retention Index")+
+  ylab("Response Factor")+
+  scale_color_manual(name = "", values = "black")+
+  scale_fill_brewer(name = "Compound Class", palette="Set1")+
+  theme_bw(base_size = 14)
+
+normc
+
+normc.p <- Cat.ms.all.q.rti %>% 
+  ggplot(aes(x = d_alkane_RTI, y = RTI.transform, color = "Response \nNormalization Curve"))+
+  geom_line(size = 2)+
+  geom_point(data = Cat.ms.all.q, aes(x = d_alkane_RTI, y = 1/slope.avg, fill = "External\nStandard\nCompounds"), shape = 21)+
+  geom_line(aes(x = d_alkane_RTI, y = RTI.transform), color = "black", size = 2)+
+  xlab("Retention Index")+
+  ylab("Response Factor")+
+  scale_color_manual(name = "", values = "black")+
+  scale_fill_brewer(name = "", palette="Set1")+
+  theme_bw(base_size = 14)
+
+normc.p
+
+# png("normcurve.p.png", width=7.5, height=4,
+#     units="in", res=1000, pointsize=5)
+# normc.p
+# dev.off()
+
+
+Cat.ms.all.q.mod <- Cat.ms.all.q 
+
+```
+Next we split into the training and test sets
+```{r}
+Cat.test.n <- Cat.test %>% 
+  dplyr::select(Compound.Name) %>% 
+  dplyr::mutate(tag = TRUE)
+
+Cat.train.n <- Cat.train %>% 
+  dplyr::select(Compound.Name) %>% 
+  dplyr::mutate(tag = TRUE)
+
+Quant.mod.train <- Cat.ms.all.q.mod %>% 
+  left_join(Cat.train.n) %>% 
+  filter(tag == TRUE) %>% 
+  dplyr::select(-tag) %>% 
+  filter(!is.na(slope.i.q))
+
+Quant.mod.test <- Cat.ms.all.q.mod %>% 
+  left_join(Cat.test.n) %>% 
+  filter(tag == TRUE)%>% 
+  dplyr::select(-tag)%>% 
+  filter(!is.na(slope.i.q))
+
+```
+```{r}
+Quant.mod.test.t <- Quant.mod.test %>% 
+  dplyr::select(-c("Compound.Name", "Formula", "Category", 
+                   "slope.avg", "RTI.transform", "inverse_slope"))
+
+Quant.mod.train.t <- Quant.mod.train %>% 
+  dplyr::select(-c("Compound.Name", "Formula", "Category", 
+                   "slope.avg", "RTI.transform", "inverse_slope"))
+
+set.seed(144)
+train.rf = train(slope.i.q ~., data = Quant.mod.train.t, method = "rf", tuneGrid = data.frame(mtry=seq(1, 45, 1)), trControl = trainControl(method = "cv", number = 5), metric = "Rsquared", na.action = na.exclude)
+
+best.rf.quant = train.rf$finalModel
+best.rf.quant
+
+rf.plot <- ggplot(train.rf$results, aes(x=mtry, y=Rsquared)) + geom_line(lwd=2) +
+  ylab("R Squared of Predictions")
+rf.plot
+
+Cat.mm = as.data.frame(model.matrix(slope.i.q ~., data = Quant.mod.test.t))
+
+set.seed(144)
+pred.best.rf = predict(best.rf.quant, newdata = Cat.mm, type = "class")
+
+Quant.mod.test.t.2 <- Quant.mod.test.t
+
+Quant.mod.test.t.2$Compound.Name <- Quant.mod.test$Compound.Name
+
+Quant.mod.test.t.2$Category <- Quant.mod.test$Category
+
+Quant.mod.test.t.2$RTI.transform <- Quant.mod.test$RTI.transform
+
+Quant.mod.test.t.2$slope.avg <- Quant.mod.test$slope.avg
+Quant.mod.test.t.2$slope.i.q.p <- pred.best.rf
+
+
+Quant.mod.test.t.2 <- Quant.mod.test.t.2 %>% 
+  dplyr::mutate(slope.avg.p = 1/(slope.i.q.p*RTI.transform)) %>% 
+  dplyr::mutate(slope_pct_err = 100*(slope.avg.p-slope.avg)/slope.avg) %>% 
+  dplyr::mutate(slope_pct_err.a = abs(slope_pct_err))
+
+Quant.mod.test.t.2 %>% 
+  ggplot(aes(slope_pct_err))+
+  geom_histogram()
+```
+
+Evaluating performance
+```{r}
+
+summary(Quant.mod.test.t.2$slope_pct_err)
+summary(Quant.mod.test.t.2$slope_pct_err.a)
+
+#geo_mean_er <- exp(mean(log(Quant.mod.test.t.2$slope_pct_err)))  
+geo_mean_er.a <- exp(mean(log(Quant.mod.test.t.2$slope_pct_err.a)))
+
+performance.p1 <- Quant.mod.test.t.2 %>% ggplot()+
+  geom_boxplot(aes(x = "Error Distribution", y = slope_pct_err))+
+  geom_boxplot(aes(x = "Absolute\n Error Distribution", y = slope_pct_err.a))+
+  ylab("% error")
+
+performance.p1
+
+mae(Quant.mod.test.t.2$slope.avg, Quant.mod.test.t.2$slope.avg.p)
+#dont know why this is returning NA
+OSR2(Quant.mod.test.t.2$slope.avg.p, Quant.mod.train$slope.avg,
+     Quant.mod.test.t.2$slope.avg)
+RMSE(Quant.mod.test.t.2$slope.avg.p, Quant.mod.test.t.2$slope.avg)
+
+prob.inspect <- Quant.mod.test.t.2 %>% 
+  filter(slope_pct_err > 100 | slope_pct_err < -50) %>% 
+  dplyr::select(Compound.Name, Category, d_alkane_RTI, RT2, slope_pct_err)
+
+Quant.mod.test.t.2 %>% 
+  ggplot(aes(x = d_alkane_RTI, y = slope_pct_err, color = Category))+
+  geom_point()
+
+Quant.mod.test.t.2 %>% 
+  ggplot(aes(x = slope.avg, y = slope.avg.p, color = slope_pct_err))+
+  geom_point()
+
+Quant.mod.test.t.2 %>% 
+  ggplot(aes(x = slope.i.q, y = slope.i.q.p, color = slope_pct_err))+
+  geom_point()
+
+summary(Quant.mod.test.t.2$slope_pct_err)
+summary(Quant.mod.test.t.2$slope_pct_err.a)
+
+Quant.mod.test.t.3 <- Quant.mod.test.t.2 %>% 
+  #filter(Compound.Name != "pyrene") %>% 
+  filter(d_alkane_RTI > 1500) 
+  
+
+mae(Quant.mod.test.t.3$slope.avg, Quant.mod.test.t.3$slope.avg.p)
+#dont know why this is returning NA
+OSR2(Quant.mod.test.t.3$slope.avg.p, Quant.mod.train$slope.avg,
+     Quant.mod.test.t.3$slope.avg)
+RMSE(Quant.mod.test.t.3$slope.avg.p, Quant.mod.test.t.3$slope.avg)
+
+summary(Quant.mod.test.t.3$slope_pct_err)
+summary(Quant.mod.test.t.3$slope_pct_err.a)
+
+geo_mean_er.a3 <- exp(mean(log(Quant.mod.test.t.3$slope_pct_err.a)))
+
+Quant.mod.test.t.3 %>% 
+  ggplot(aes(x = slope.i.q, y = slope.i.q.p, color = slope_pct_err))+
+  geom_point()
+
+line <- data.frame(x = c(0, .01), y = c(0, .01))
+
+qf.p <- Quant.mod.test.t.3 %>% 
+  ggplot(aes(x = slope.avg, y = slope.avg.p, color = slope_pct_err))+
+  geom_point(size = 2, shape =16)+
+  geom_point(aes(x = slope.avg, y = slope.avg.p), size = 2, shape = 1, color = "black")+
+  geom_line(data = line, aes(x = x, y = y), color = "black")+
+  theme_bw(base_size = 14)+
+  theme(legend.key.size = unit(.4, 'cm'))+
+  xlab("True Quantification Factor")+
+  ylab("Predicted Quantification Factor")+
+  lims(colour = c(-100, 450))+
+  scale_color_gradient2(name = "% error", high = "green4", low = "red4", mid = "yellow")
+
+qf.p
+
+png("qf.p.png", width=5.5, height=4,
+    units="in", res=1000, pointsize=5)
+qf.p
+dev.off()
+
+line2 <- data.frame(x = c(-8.9, -1), y = c(-8.9, -1))
+
+qf.p2 <- Quant.mod.test.t.2 %>% 
+  ggplot(aes(x = log(slope.avg), y = log(slope.avg.p), color = slope_pct_err))+
+  geom_point(size = 2, shape =16)+
+  geom_point(aes(x = log(slope.avg), y = log(slope.avg.p)), size = 2, shape = 1, color = "black")+
+  geom_line(data = line2, aes(x = x, y = y), color = "black")+
+  theme_bw(base_size = 14)+
+  theme(legend.key.size = unit(.4, 'cm'))+
+  xlab("log(True Quantification Factor)")+
+  ylab("log(Predicted Quantification Factor)")+
+  lims(colour = c(-100, 450))+
+  xlim(-9, -1)+
+  ylim(-9, -1)+
+  scale_color_gradient2(name = "% error", high = "green4", low = "red4", mid = "yellow")
+
+qf.p2
+
+png("qf.p2.png", width=5.5, height=4,
+    units="in", res=1000, pointsize=5)
+qf.p2
+dev.off()
+
+```
+From this, it appears that quantification is working well above retention index of 1500, now we identify whether this is an acceptable approach 
+# Now loading the sample compounds to see if restricting to > 1500 will be acceptable
+
+```{r}
+SS_sample <- read_csv("Files/Compiled_Compound_info_SeaScape_EBF.ed.csv") %>% 
+  mutate(under_1500 = ifelse(LRI.I<1500, TRUE, FALSE))
+
+sum(SS_sample$under_1500)
+pct = sum(SS_sample$under_1500)/nrow(SS_sample)
+
+SS_sample.q.mod <- SS_sample %>% 
+  filter(Model_Quant == TRUE)
+
+pct.q.mod = sum(SS_sample.q.mod$under_1500)/nrow(SS_sample.q.mod)
+
+SS_sample %>% 
+  ggplot(aes(x = LRI.I, fill = under_1500))+
+  geom_histogram(breaks=c(1200, 1300, 1400, 1500,1600, 1700, 1800, 
+                          1900, 2000,2100, 2200, 2300, 2400, 2500,2600, 2700, 
+                          2800, 2900, 3000))
+
+
+```
+Conclusion: as <5% of the compounds will be impacted by the volatile quantification issues, manually quantifying these species or leaving them out of the total mass accounting could be appropriate steps
+
+## Quantification Modeling
+Here we parse the mass spectra of the sample seascape compounds
+
+```{r}
+SS_Mass_Spec <- read_csv("Files/SeaScape_lib_withMS.csv")
+
+SS_table_o = SS_Mass_Spec %>% 
+  filter(!is.na(Name))
+
+
+SS_table_RT2 <- SS_table_o %>% 
+  dplyr::select(Name, RT2)
+
+#trim.leading <- function (x)  sub("^\\s+", "", x)
+
+SS_table_t = SS_table_o %>% 
+    dplyr::mutate(MS = strsplit(as.character(MS), ";")) %>% 
+    unnest(MS) %>% 
+    filter(MS != "") %>% 
+    dplyr::mutate(MS2 = trim.leading(MS)) 
+  
+
+
+
+SS_table_3 = separate(data = SS_table_t, col = MS2, into = c("mz", "intensity"), sep = " ")
+
+SS_table_full = SS_table_3 %>% 
+  dplyr::mutate(intensity = as.numeric(intensity)) %>% 
+  dplyr::mutate(mz = as.numeric(mz)) %>% 
+  arrange(desc(intensity)) %>% 
+  arrange(desc(Name)) %>% 
+  group_by(Name) %>%
+  dplyr::mutate(my_ranks = order(order(intensity, decreasing=TRUE))) %>% 
+  ungroup()
+
+SS_names <- SS_table_o %>% 
+  dplyr::select("Name")
+
+SS_table_trimmed = SS_table_full %>% 
+  filter(my_ranks < 11)
+
+mz_tab.s <- as.data.frame(table(SS_table_trimmed$mz))
+
+mz_tab.s <- mz_tab.s %>% 
+  dplyr::mutate(mz = as.character(Var1)) %>% 
+  dplyr::mutate(mz = as.numeric(mz))
+mz_tab.s <- mz_tab.s %>% 
+  arrange(desc(Freq)) %>% 
+  dplyr::mutate(freq_ranks = order(order(Freq, decreasing = TRUE)))
+
+SS_table_ranked <- SS_table_trimmed %>% 
+  left_join(mz_tab.s) 
+# %>% 
+#   filter(freq_ranks< 41)
+
+# note- here selecting only the MZ of the most common ES list so that the
+#model will be usable
+SS_common_mz = SS_table_ranked %>%
+  dplyr::select(Name, mz, intensity) %>% 
+  dplyr::mutate(mz = paste("mz_", mz, sep = "_")) %>% 
+  dplyr::mutate(mz_obs = TRUE) %>% 
+  dplyr::mutate(mz_intensity = intensity) %>% 
+  left_join(peak_list.es) %>% 
+  filter(istop40 == TRUE) %>% 
+  dplyr::select(-istop40)
+
+wide_mz.s = SS_common_mz %>% 
+  dplyr::select(Name, mz, mz_obs) %>% 
+  spread(mz, mz_obs, fill = FALSE) 
+
+wide_mz.s <- SS_names %>% 
+  left_joinF(wide_mz.s)
+
+
+
+wide_mz_i.s = SS_common_mz %>% 
+  dplyr::select(Name, mz, mz_intensity) %>% 
+  spread(mz, mz_intensity, fill = 0) 
+  
+wide_mz_i.s <- SS_names %>% 
+  left_join0(wide_mz_i.s)
+
+unique_names.s = unique(SS_table_trimmed$Name)
+
+# Now parsing out losses
+
+
+names_losses.s = as.character(rep(unique_names.s, each = length(d2$x)))
+losses_vec.s = rep(999, times = length(names_losses.s))
+loss_num.s = rep(seq(1, 10, 1), times = length(unique_names.s))
+
+losses.s <- data.frame(names_losses= names_losses.s, losses_vec = losses_vec.s, loss_num = loss_num.s)
+losses.s = losses.s %>% 
+  dplyr::mutate(names_losses = as.character(names_losses))
+
+
+
+for(i in 1:nrow(losses.s)) {
+  #i = 1
+  
+  name_t = names_losses.s[i]
+  loss_num_t = losses.s$loss_num[i]
+  
+  upper_index = xt[loss_num_t]
+  lower_index = yt[loss_num_t]
+  
+  df_t = SS_table_trimmed %>% 
+    filter(Name == name_t)
+  
+  upper_mz = df_t$mz[upper_index]
+  lower_mz = df_t$mz[lower_index]
+  
+
+  losses.s$losses_vec[i] = abs(upper_mz - lower_mz)
+  
+}
+
+arranged_mz.s <- SS_table_trimmed %>% 
+  arrange(desc(mz)) %>% 
+  arrange(desc(Name)) %>% 
+  dplyr::mutate(loss_fast = 0)
+
+for(i in 2:nrow(arranged_mz.s)){
+  arranged_mz.s$loss_fast[i]= arranged_mz.s$mz[i-1]-arranged_mz.s$mz[i]
+}
+
+arranged_mz.t.s <- as.data.frame(table(arranged_mz.s$loss_fast)) %>% 
+  dplyr::mutate(num_loss = as.character(Var1)) %>% 
+  dplyr::mutate(num_loss = as.numeric(num_loss)) %>% 
+  filter(num_loss > 0) %>% 
+  arrange(desc(Freq)) %>% 
+  dplyr::mutate(id = row_number())
+
+
+losses.s = losses.s %>%
+  left_join(arranged_mz.t.s, by = c("losses_vec"= "num_loss"))
+
+losses_trimmed.s = losses.s 
+
+# again selecting the losses from the ES list so that data format will be identical
+SS_common_losses = losses_trimmed.s %>%
+  dplyr::select(names_losses, losses_vec) %>% 
+  dplyr::mutate(losses_vec = paste("loss_", losses_vec, sep = "_")) %>% 
+  dplyr::mutate(Loss_obs = TRUE) %>% 
+  distinct() %>% 
+  left_join(loss_list.es) %>% 
+  filter(istop20 == TRUE) %>% 
+  dplyr::select(-istop20)
+
+wide_losses.s = SS_common_losses %>% 
+  spread(losses_vec, Loss_obs, fill = FALSE) %>% 
+  right_join(SS_names, by = c("names_losses"= "Name"))
+
+wide_losses.s[is.na(wide_losses.s)] <- FALSE
+
+
+```
+## Modeling quantification factors for all sample compounds
+
+```{r}
+SS_table_formod <- SS_table_o %>% 
+  dplyr::select(Name, d_alkane_RTI, RT2) %>% 
+  left_join(wide_mz_i.s) %>% 
+  left_join(wide_losses.s, by = c("Name" = "names_losses")) %>% 
+  dplyr::rename(Compound.Name = Name) %>% 
+  dplyr::mutate(RTI.transform = NA)
+
+
+
+for(i in 1:nrow(SS_table_formod
+)){
+  lri = SS_table_formod$d_alkane_RTI[i]
+  if(lri<1870){
+    SS_table_formod$RTI.transform[i] = (0.0000074*exp(0.0105*lri))
+  }else{
+    SS_table_formod$RTI.transform[i] = (37900*exp(lri*-.00147))
+  }
+}
+
+
+SS_table_formod.t <- SS_table_formod %>% 
+  dplyr::select(-c(Compound.Name, RTI.transform)) %>% 
+  mutate(slope.i.q = -999)
+
+Cat.mm.ss = as.data.frame(model.matrix(slope.i.q ~., data = SS_table_formod.t))
+
+set.seed(144)
+pred.best.rf.ss = predict(best.rf.quant, newdata = Cat.mm.ss, type = "class")
+
+SS_table_formod.t.2 <- SS_table_formod.t
+
+SS_table_formod.t.2$Compound.Name <- SS_table_formod$Compound.Name
+
+SS_table_formod.t.2$Category <- SS_table_formod$Category
+
+SS_table_formod.t.2$RTI.transform <- SS_table_formod$RTI.transform
+
+
+SS_table_formod.t.2$slope.i.q.p <- pred.best.rf.ss
+
+SS_table_formod.t.2 <- SS_table_formod.t.2 %>% 
+  dplyr::mutate(slope.avg.p = 1/(slope.i.q.p*RTI.transform))
+
+
+# note that units of quant factor Rf pred = ng compound / (volume blob, normalized by the self-normalized IS volumes)
+SS_table_formod.slopes <- SS_table_formod.t.2 %>% 
+  dplyr::select(Compound.Name, slope.i.q.p, slope.avg.p) %>% 
+  rename(Quant_Factor_RFpred = slope.avg.p)
+
+ES_just_slopes <- real_cc_avg %>% 
+  dplyr::select(Compound.Name, slope.avg)
+
+SS_sample_quant <- SS_sample %>% 
+  left_join(SS_table_formod.slopes) %>% 
+  mutate(Quant_Factor_final = NA) %>% 
+  left_join(ES_just_slopes, by = c("Compound.Name_ES" = "Compound.Name"))
+
+for(i in 1:nrow(SS_sample_quant)){
+  if(SS_sample_quant$Model_Quant[i] == TRUE){
+    SS_sample_quant$Quant_Factor_final[i]=SS_sample_quant$Quant_Factor_RFpred[i]
+    SS_sample_quant$slope.avg[i] = NA
+  }else{
+    SS_sample_quant$Quant_Factor_final[i] <- SS_sample_quant$slope.avg[i]
+  }
+}
+
+
+
+write.csv(SS_sample_quant, "Files/Write/Compiled_Compound_info_SeaScape.quant_EBF_3.csv")
+
+
+```
+
+
+ 

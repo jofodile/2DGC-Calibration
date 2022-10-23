@@ -1,0 +1,133 @@
+Compound.Name,Category,Formula
+"12-OH C18 Acid, TMS",Acid,C18H36O3
+"16-OH C16 Acid, TMS",Acid,C16H32O3
+"2-Ketoglutaric acid, tri-TMS",Acid,C5H6O5
+4-Benzoylbenzoic acid,Acid,C14H10O3
+4-hydroxybenzoic acid,Acid,C7H6O3
+abietic acid,Acid,C20H30O2
+C10 carboxylic acid,Acid,C10H20O2
+C10 diacid (sebacic acid),Acid,C10H18O4
+C12 diacid,Acid,C12H22O4
+C13 acid,Acid,C13H26O2
+C14 Diacid,Acid,C14H26O4
+C16 Acid,Acid,C16H32O2
+C17 acid,Acid,C17H34O2
+C18 Acid,Acid,C18H36O2
+C22 acid,Acid,C22H44O2
+C24 acid,Acid,C24H48O2
+C26 acid,Acid,C26H52O2
+C28 acid,Acid,C28H56O2
+C7 acid,Acid,C7H14O2
+C8 acid,Acid,C8H16O2
+C9 acid,Acid,C9H18O2
+C9 Diacid (azelaic acid),Acid,C9H16O4
+Caffeic acid,Acid,C9H8O4
+"cis-Vaccenic Acid, TMS",Acid,C18H34O2
+Dehydroabietic acid,Acid,C20H28O2
+deoxycholic acid,Acid,C24H40O4
+"dimethyl Glutaric Acid, TMS",Acid,C7H12O4
+DL-B-hydroxymyristic acid,Acid,C14H28O3
+FAME16 (Methyl Palmitate),Acid,C17H34O2
+FAME18 (Methyl Stearate),Acid,C19H38O2
+isopimaric acid,Acid,C20H30O2
+ketopinic acid,Acid,C10H14O3
+"linoleic Acid, TMS",Acid,C18H32O2
+"Malic acid, 3TMS derivative",Acid,C4H6O4
+MBTCA,Acid,C8H12O6
+Me-OH-glutatric acid,Acid,C6H10O5
+"oleic Acid, TMS",Acid,C18H34O2
+p-anisic acid (4-methozybenzoic acid),Acid,C8H8O3
+phthalic acid,Acid,C8H6O4
+pinic acid 1,Acid,C9H14O4
+pinic acid 2,Acid,C9H14O4
+pinonic acid,Acid,C10H16O3
+syringic acid,Acid,C9H10O5
+"Tartaric acid, 4TMS",Acid,C4H6O6
+trans ferulic acid,Acid,C10H10O4
+Tricarballylic acid,Acid,C6H8O6
+vanillic acid,Acid,C8H8O4
+3-5-dimethoxyphenol,Alcohol,C8H10O3
+a-Amyrin,Alcohol,C30H50O
+a-bisabolol,Alcohol,C15H16O
+arabitol,Alcohol,C5H12O5
+bisabolol,Alcohol,C15H26O
+"Citronellol, TMS",Alcohol,C10H20O
+"eicosanol, TMS",Alcohol,C20H42O
+erythreitol,Alcohol,C4H10O4
+Farnesol,Alcohol,C15H26O
+Hexadecanol,Alcohol,C16H34O
+isoeugenol,Alcohol,C10H12O2
+maltol,Alcohol,C6H6O3
+monopalmitin,Alcohol,C19H38O4
+monostearin,Alcohol,C21H42O4
+octadecanol,Alcohol,C18H38O
+syringol,Alcohol,C8H10O3
+threitol,Alcohol,C4H10O4
+sinapinaldehyde,Aldehyde,C11H12O4
+syringaldehyde,Aldehyde,C9H10O4
+tridecanal,Aldehyde,C13H26O
+vanillin,Aldehyde,C8H8O3
+C34,Alkane,C3470
+C16,Alkane,C16H34
+C17,Alkane,C17H36
+C18,Alkane,C18H38
+C19,Alkane,C19H40
+C20,Alkane,C20H42
+C21,Alkane,C21H44
+C22,Alkane,C22H46
+C23,Alkane,C23H48
+C24,Alkane,C24H50
+C25,Alkane,C25H52
+C26,Alkane,C26H54
+C27,Alkane,C27H56
+C28,Alkane,C28H58
+C29,Alkane,C29H60
+C30,Alkane,C30H62
+C31,Alkane,C31H64
+C32,Alkane,C32H66
+C33,Alkane,C33H68
+C35,Alkane,C35H72
+DEET,Amide,C12H17NO
+hexadecanamide,Amide,C16H33NO
+anthraquinone,Arom,C14H8O2
+benzophenone,Arom,C13H10O
+chrysene,Arom,C18H12
+dibenz(ah)anthracene,Arom,C22H14
+dodecyl benzene,Arom,C18H30
+hydroquinone,Arom,C6H6O2
+perylene,Arom,C20H12
+pyrene,Arom,C16H10
+Quinoline,Arom,C9H7N
+Pyrocatechoic acid,Cat,C6H6O2
+resorcinol,Cat,C6H6O2
+4-nitrocatechol,Misc,C6H5NO4
+"4, 4 dimethoxy-benzophenone",Ketone,C15H14O3
+9H-Florenone,Ketone,C13H8O
+ionone,Ketone,C13H20O
+octadecanone,Ketone,C18H36O
+pentadecanone,Ketone,C15H30O
+xanthone,Ketone,C13H8O2
+2-(methylmercapto)benzothiazole,Misc,C8H7NS2
+2-mercaptobenzothiazole,Misc,C7H5NS2
+4-Bromodiphenylamine,Misc,C12H10BrN
+Benzothiazole,Misc,C7H5NS
+"Benzothiazole, 2-phenyl-",Misc,C13H9NS
+DPPA,Misc,C12H10N3O3P
+"homosalate, TMS",Misc,C16H22O3
+nonanenitrile,Misc,C9H17N
+phthalimide,Misc,C8H5NO2
+triacetin,Misc,C9H14O6
+beta-sitosterol,Sterol,C29H50O
+cholesterol,Sterol,C27H46O
+stigmasterol,Sterol,C29H48O
+galactosan,Sugar,C6H10O5
+gamma dodecalactone,Sugar,C12H22O2
+levoglucosan,Sugar,C6H10O5
+mannosan,Sugar,C6H10O5
+Sugar 1,Sugar,
+Sugar 2,Sugar,
+Sugar 3,Sugar,
+Sugar 4,Sugar,
+Sugar 5,Sugar,
+Sugar 6,Sugar,
+squalene,Alkane,C30H50
